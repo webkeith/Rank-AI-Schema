@@ -1,18 +1,18 @@
 <?php
 /**
  * Plugin Name:  Rank AI Schema
- * Plugin URI:   https://github.com/YOUR_GITHUB_USERNAME/rank-ai-schema
+ * Plugin URI:   https://github.com/webkeith/Rank-AI-Schema
  * Description:  JSON-LD Schema markup + full SEO analysis engine with per-page scoring, site-wide reports, and rich results compliance.
  * Version:      2.0.0
- * Author:       Your Name
- * Author URI:   https://yourwebsite.com
+ * Author:       Keith Quinones
+ * Author URI:   https://github.com/webkeith/
  * License:      GPL v2 or later
  * License URI:  https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:  rank-ai-schema
  * Domain Path:  /languages
  * Requires at least: 5.8
  * Requires PHP: 7.4
- * Update URI:   https://github.com/YOUR_GITHUB_USERNAME/rank-ai-schema
+ * Update URI:   https://github.com/webkeith/Rank-AI-Schema
  *
  * @package RankAISchema
  *

@@ -1,5 +1,5 @@
 === Rank AI Schema ===
-Contributors: yourname
+Contributors: Keith Quinones
 Tags: schema, json-ld, seo, structured data, rich results
 Requires at least: 5.8
 Tested up to: 6.5
