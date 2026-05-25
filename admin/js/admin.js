@@ -224,6 +224,18 @@
         var icons = { pass: '✓', warn: '⚠', fail: '✗' };
         var catNames = RAS_SEO.cats;
         var catIcons = RAS_SEO.catIcons;
+        // Add product category dynamically if WooCommerce checks present.
+        var hasProductCat = Object.values(checks).some(function(r) { return r.cat === 'product'; });
+        if (hasProductCat) {
+            catOrder.push('product');
+            if (!catNames['product']) { catNames['product'] = 'WooCommerce Product'; }
+            if (!catIcons['product']) { catIcons['product'] = '🛒'; }
+            if (!grouped['product']) { grouped['product'] = []; }
+            Object.keys(checks).forEach(function(id) {
+                var r = checks[id];
+                if (r.cat === 'product') { grouped['product'].push(r); }
+            });
+        }
         var html = '';
 
         catOrder.forEach(function (cat) {

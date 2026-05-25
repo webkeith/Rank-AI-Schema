@@ -183,6 +183,14 @@ class RAS_SEO_Analyzer {
         $results['og_desc']  = self::r( $og_d ? 'pass' : 'warn', $checks['og_desc'],  $og_d ? 'Set' : 'Using meta desc',  ! $og_d ? $checks['og_desc'][4] : '' );
         $results['og_image'] = self::r( $og_img_final ? 'pass' : 'fail', $checks['og_image'], $og_img_final ? 'Set' : 'No image found', ! $og_img_final ? $checks['og_image'][4] : '' );
 
+        /* ── WooCommerce product-specific checks ── */
+        if ( $post->post_type === 'product' && class_exists( 'RAS_Woo_Bridge' ) && RAS_Woo_Bridge::is_active() ) {
+            $woo_checks = RAS_Woo_Bridge::seo_checks( $post_id );
+            foreach ( $woo_checks as $id => $r ) {
+                $results[ $id ] = $r;
+            }
+        }
+
         /* ── Keyword (only if set) ── */
         if ( $kw ) {
             $kw_count   = substr_count( strtolower( $txt ), $kw );

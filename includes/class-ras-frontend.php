@@ -2,6 +2,8 @@
 /**
  * Frontend — JSON-LD schema output & meta tags.
  * Fully Google Rich Results compliant.
+ * Supports all public post types, custom post types, and WooCommerce products.
+ *
  * @package RankAISchema
  */
 if ( ! defined( 'ABSPATH' ) ) { exit; }
@@ -13,35 +15,36 @@ class RAS_Frontend {
     }
 
     public static function output() {
-        $g = RAS_Settings::get();
+        $g       = RAS_Settings::get();
         $schemas = [];
 
-        /* 1. Organization */
+        // 1. Organization (all pages).
         if ( '1' === $g['organization'] ) {
             $schemas[] = self::organization( $g );
         }
 
-        /* 2. WebSite + Sitelinks Searchbox (homepage only) */
+        // 2. WebSite + Sitelinks Searchbox (homepage only).
         if ( is_front_page() && '1' === $g['sitelinks'] ) {
             $schemas[] = self::website( $g );
         }
 
-        /* 3. BreadcrumbList */
+        // 3. BreadcrumbList (non-home).
         if ( ! is_front_page() && '1' === $g['breadcrumbs'] ) {
             $bc = self::breadcrumbs();
             if ( $bc ) { $schemas[] = $bc; }
         }
 
-        /* 4. Per-page schema */
+        // 4. Per-page schema (any singular post type, including CPTs and WC products).
         if ( is_singular() ) {
             $ps = self::page_schema( get_the_ID() );
             if ( $ps ) { $schemas[] = $ps; }
         }
 
-        /* 5. Meta / OG tags */
+        // 5. Meta/OG tags.
         self::meta_tags();
 
         foreach ( $schemas as $s ) {
+            if ( ! $s ) { continue; }
             echo "\n<script type=\"application/ld+json\">\n";
             echo wp_json_encode( $s, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ); // phpcs:ignore
             echo "\n</script>\n";
@@ -58,37 +61,122 @@ class RAS_Frontend {
         $og_i = get_post_meta( $id, '_ras_og_image', true );
         $noix = get_post_meta( $id, '_ras_noindex', true );
 
-        if ( $desc ) {
-            printf( '<meta name="description" content="%s">' . "\n", esc_attr( $desc ) );
+        // WooCommerce short description as fallback description.
+        if ( ! $desc && RAS_Woo_Bridge::is_active() ) {
+            $product = wc_get_product( $id );
+            if ( $product ) {
+                $desc = wp_strip_all_tags( $product->get_short_description() );
+            }
         }
-        if ( $noix ) {
-            echo '<meta name="robots" content="noindex,nofollow">' . "\n";
-        }
+
+        if ( $desc )  { printf( '<meta name="description" content="%s">' . "\n", esc_attr( $desc ) ); }
+        if ( $noix )  { echo '<meta name="robots" content="noindex,nofollow">' . "\n"; }
+
         $og_title = $og_t ?: get_the_title( $id );
         $og_desc  = $og_d ?: $desc ?: wp_trim_words( get_the_excerpt( $id ), 30 );
         $og_img   = $og_i ?: ( has_post_thumbnail( $id ) ? wp_get_attachment_url( get_post_thumbnail_id( $id ) ) : '' );
 
-        printf( '<meta property="og:type" content="article">' . "\n" );
+        // WooCommerce product image fallback for OG.
+        if ( ! $og_img && RAS_Woo_Bridge::is_active() ) {
+            $product = wc_get_product( $id );
+            if ( $product ) {
+                $src = wp_get_attachment_image_src( $product->get_image_id(), 'full' );
+                if ( $src ) { $og_img = $src[0]; }
+            }
+        }
+
+        echo '<meta property="og:type" content="' . ( get_post_type( $id ) === 'product' ? 'product' : 'article' ) . '">' . "\n";
         printf( '<meta property="og:title" content="%s">' . "\n", esc_attr( $og_title ) );
         printf( '<meta property="og:url" content="%s">' . "\n", esc_url( get_permalink( $id ) ) );
-        if ( $og_desc ) {
-            printf( '<meta property="og:description" content="%s">' . "\n", esc_attr( $og_desc ) );
+        if ( $og_desc ) { printf( '<meta property="og:description" content="%s">' . "\n", esc_attr( $og_desc ) ); }
+        if ( $og_img )  { printf( '<meta property="og:image" content="%s">' . "\n", esc_url( $og_img ) ); }
+
+        // WooCommerce OG product meta.
+        if ( get_post_type( $id ) === 'product' && RAS_Woo_Bridge::is_active() ) {
+            $product = wc_get_product( $id );
+            if ( $product && $product->get_price() ) {
+                printf( '<meta property="product:price:amount" content="%s">' . "\n", esc_attr( wc_format_decimal( $product->get_price(), 2 ) ) );
+                printf( '<meta property="product:price:currency" content="%s">' . "\n", esc_attr( get_woocommerce_currency() ) );
+            }
         }
-        if ( $og_img ) {
-            printf( '<meta property="og:image" content="%s">' . "\n", esc_url( $og_img ) );
+    }
+
+    /* ── Per-page schema dispatcher ───────────────── */
+    public static function page_schema( $post_id ) {
+        $post      = get_post( $post_id );
+        $g         = RAS_Settings::get();
+        $mode      = get_post_meta( $post_id, '_ras_schema_mode', true ) ?: 'global';
+        $post_type = $post ? $post->post_type : 'post';
+
+        if ( 'disabled' === $mode ) { return null; }
+
+        // Schema type: override → per-page meta; global → CPT default from settings.
+        if ( 'override' === $mode ) {
+            $type = get_post_meta( $post_id, '_ras_schema_type', true ) ?: RAS_Settings::schema_type_for_post_type( $post_type );
+        } else {
+            $type = RAS_Settings::schema_type_for_post_type( $post_type );
+        }
+
+        switch ( $type ) {
+            case 'Article':
+            case 'BlogPosting':
+            case 'NewsArticle':
+                return self::article( $type, $post, $g );
+
+            case 'FAQPage':
+                return self::faq( $post );
+
+            case 'HowTo':
+                return self::howto( $post );
+
+            case 'Product':
+                // WooCommerce bridge takes priority when active and bridge is enabled.
+                if ( '1' === $g['woo_bridge'] && RAS_Woo_Bridge::is_active() && $post_type === 'product' ) {
+                    return RAS_Woo_Bridge::product_schema( $post_id, $g );
+                }
+                return self::product( $post, $g );
+
+            case 'Event':
+                return self::event( $post, $g );
+
+            case 'Recipe':
+                return self::recipe( $post, $g );
+
+            case 'LocalBusiness':
+                return self::local_business( $post, $g );
+
+            case 'JobPosting':
+                return self::job_posting( $post, $g );
+
+            case 'Course':
+                return self::course( $post, $g );
+
+            case 'SoftwareApplication':
+                return self::software_app( $post, $g );
+
+            case 'VideoObject':
+                return self::video_object( $post, $g );
+
+            case 'Custom':
+                $raw = get_post_meta( $post_id, '_ras_custom_json', true );
+                $dec = json_decode( stripslashes( (string) $raw ), true );
+                return is_array( $dec ) ? $dec : null;
+
+            case 'WebPage':
+            default:
+                return self::webpage( $post, $g );
         }
     }
 
     /* ── Organization ─────────────────────────────── */
     private static function organization( $g ) {
-        $org_url = trailingslashit( $g['org_url'] );
+        $url = trailingslashit( $g['org_url'] );
         $s = [
             '@context' => 'https://schema.org', '@type' => 'Organization',
-            '@id'  => $org_url . '#organization',
-            'name' => $g['org_name'], 'url' => $g['org_url'],
+            '@id' => $url . '#organization', 'name' => $g['org_name'], 'url' => $g['org_url'],
         ];
         if ( $g['org_logo'] ) {
-            $dim = self::image_dims( $g['org_logo'] );
+            $dim  = self::image_dims( $g['org_logo'] );
             $logo = [ '@type' => 'ImageObject', 'url' => $g['org_logo'] ];
             if ( $dim ) { $logo['width'] = $dim[0]; $logo['height'] = $dim[1]; }
             $s['logo'] = $logo;
@@ -102,13 +190,12 @@ class RAS_Frontend {
         return $s;
     }
 
-    /* ── WebSite + Sitelinks Searchbox ───────────── */
+    /* ── WebSite + Sitelinks ──────────────────────── */
     private static function website( $g ) {
         $url = trailingslashit( $g['org_url'] );
         return [
             '@context' => 'https://schema.org', '@type' => 'WebSite',
-            '@id'  => $url . '#website',
-            'name' => $g['org_name'], 'url' => $g['org_url'],
+            '@id' => $url . '#website', 'name' => $g['org_name'], 'url' => $g['org_url'],
             'potentialAction' => [
                 '@type' => 'SearchAction',
                 'target' => [ '@type' => 'EntryPoint', 'urlTemplate' => $url . '?s={search_term_string}' ],
@@ -123,69 +210,52 @@ class RAS_Frontend {
         $pos   = 2;
         if ( is_singular() ) {
             $post = get_post();
-            if ( 'post' === $post->post_type ) {
+            // WooCommerce: add product category.
+            if ( $post->post_type === 'product' ) {
+                $terms = get_the_terms( $post->ID, 'product_cat' );
+                if ( $terms && ! is_wp_error( $terms ) ) {
+                    $term    = array_shift( $terms );
+                    $items[] = [ '@type' => 'ListItem', 'position' => $pos++, 'name' => $term->name, 'item' => get_term_link( $term ) ];
+                }
+            } elseif ( 'post' === $post->post_type ) {
                 $cats = get_the_category( $post->ID );
                 if ( $cats ) {
-                    $items[] = [ '@type' => 'ListItem', 'position' => $pos++,
-                                 'name' => html_entity_decode( $cats[0]->name ),
-                                 'item' => get_category_link( $cats[0]->term_id ) ];
+                    $items[] = [ '@type' => 'ListItem', 'position' => $pos++, 'name' => $cats[0]->name, 'item' => get_category_link( $cats[0]->term_id ) ];
+                }
+            } else {
+                // Generic CPT: add the post type archive link.
+                $pt_obj = get_post_type_object( $post->post_type );
+                if ( $pt_obj && $pt_obj->has_archive ) {
+                    $archive_url = get_post_type_archive_link( $post->post_type );
+                    if ( $archive_url ) {
+                        $items[] = [ '@type' => 'ListItem', 'position' => $pos++, 'name' => $pt_obj->label, 'item' => $archive_url ];
+                    }
                 }
             }
-            $items[] = [ '@type' => 'ListItem', 'position' => $pos,
-                         'name' => html_entity_decode( get_the_title( $post->ID ) ),
-                         'item' => get_permalink( $post->ID ) ];
+            $items[] = [ '@type' => 'ListItem', 'position' => $pos, 'name' => html_entity_decode( get_the_title( $post->ID ) ), 'item' => get_permalink( $post->ID ) ];
         } elseif ( is_category() || is_tag() || is_tax() ) {
             $t = get_queried_object();
-            $items[] = [ '@type' => 'ListItem', 'position' => $pos, 'name' => html_entity_decode( $t->name ), 'item' => get_term_link( $t ) ];
+            $items[] = [ '@type' => 'ListItem', 'position' => $pos, 'name' => $t->name, 'item' => get_term_link( $t ) ];
+        } elseif ( is_post_type_archive() ) {
+            $pt = get_queried_object();
+            $items[] = [ '@type' => 'ListItem', 'position' => $pos, 'name' => $pt->label, 'item' => get_post_type_archive_link( $pt->name ) ];
         }
         if ( count( $items ) < 2 ) { return null; }
         return [ '@context' => 'https://schema.org', '@type' => 'BreadcrumbList', 'itemListElement' => $items ];
     }
 
-    /* ── Per-page schema dispatcher ──────────────── */
-    public static function page_schema( $post_id ) {
-        $mode = get_post_meta( $post_id, '_ras_schema_mode', true ) ?: 'global';
-        if ( 'disabled' === $mode ) { return null; }
-        $type = get_post_meta( $post_id, '_ras_schema_type', true ) ?: 'Article';
-        $post = get_post( $post_id );
-        $g    = RAS_Settings::get();
-
-        switch ( $type ) {
-            case 'Article': case 'BlogPosting': case 'NewsArticle':
-                return self::article( $type, $post, $g );
-            case 'FAQPage':
-                return self::faq( $post );
-            case 'HowTo':
-                return self::howto( $post );
-            case 'Product':
-                return self::product( $post, $g );
-            case 'Event':
-                return self::event( $post, $g );
-            case 'Recipe':
-                return self::recipe( $post, $g );
-            case 'LocalBusiness':
-                return self::local_business( $post, $g );
-            case 'Custom':
-                $raw = get_post_meta( $post_id, '_ras_custom_json', true );
-                $dec = json_decode( stripslashes( (string) $raw ), true );
-                return is_array( $dec ) ? $dec : null;
-            default:
-                return self::webpage( $post, $g );
-        }
-    }
-
-    /* ── Article ──────────────────────────────────── */
+    /* ── Article / BlogPosting / NewsArticle ──────── */
     private static function article( $type, $post, $g ) {
-        $url   = get_permalink( $post->ID );
-        $title = html_entity_decode( get_the_title( $post->ID ) );
-        $g_url = trailingslashit( $g['org_url'] );
+        $url     = get_permalink( $post->ID );
+        $g_url   = trailingslashit( $g['org_url'] );
+        $title   = html_entity_decode( get_the_title( $post->ID ) );
 
-        $publisher = [ '@type' => 'Organization', '@id' => $g_url . '#organization', 'name' => $g['org_name'] ];
+        $pub  = [ '@type' => 'Organization', '@id' => $g_url . '#organization', 'name' => $g['org_name'] ];
         if ( $g['org_logo'] ) {
-            $dim = self::image_dims( $g['org_logo'] );
+            $dim  = self::image_dims( $g['org_logo'] );
             $logo = [ '@type' => 'ImageObject', 'url' => $g['org_logo'] ];
             if ( $dim ) { $logo['width'] = $dim[0]; $logo['height'] = $dim[1]; }
-            $publisher['logo'] = $logo;
+            $pub['logo'] = $logo;
         }
 
         $author_name = get_post_meta( $post->ID, '_ras_author_name', true ) ?: get_the_author_meta( 'display_name', $post->post_author );
@@ -200,11 +270,10 @@ class RAS_Frontend {
             'datePublished'    => get_the_date( 'c', $post->ID ),
             'dateModified'     => get_the_modified_date( 'c', $post->ID ),
             'author'           => [ '@type' => 'Person', 'name' => $author_name, 'url' => $author_url ],
-            'publisher'        => $publisher,
+            'publisher'        => $pub,
             'description'      => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
             'inLanguage'       => get_bloginfo( 'language' ),
         ];
-
         $imgs = self::post_images( $post->ID );
         if ( $imgs ) { $s['image'] = count( $imgs ) > 1 ? $imgs : $imgs[0]; }
         return $s;
@@ -226,7 +295,7 @@ class RAS_Frontend {
                  'url'  => get_permalink( $post->ID ), 'mainEntity' => $main ];
     }
 
-    /* ── HowTo ───────────────────────────────────── */
+    /* ── HowTo ────────────────────────────────────── */
     private static function howto( $post ) {
         $raw   = get_post_meta( $post->ID, '_ras_steps', true );
         $steps = json_decode( stripslashes( (string) $raw ), true ) ?: [];
@@ -240,9 +309,8 @@ class RAS_Frontend {
         }
         if ( ! $built ) { return null; }
         $s = [ '@context' => 'https://schema.org', '@type' => 'HowTo',
-               'name'  => html_entity_decode( get_the_title( $post->ID ) ),
-               'url'   => get_permalink( $post->ID ),
-               'step'  => $built ];
+               'name' => html_entity_decode( get_the_title( $post->ID ) ),
+               'url'  => get_permalink( $post->ID ), 'step' => $built ];
         $tt = get_post_meta( $post->ID, '_ras_total_time', true );
         if ( $tt ) { $s['totalTime'] = $tt; }
         $img = self::post_image( $post->ID );
@@ -250,21 +318,21 @@ class RAS_Frontend {
         return $s;
     }
 
-    /* ── Product ──────────────────────────────────── */
+    /* ── Product (manual fields — non-WooCommerce) ── */
     private static function product( $post, $g ) {
         $price = get_post_meta( $post->ID, '_ras_price', true );
         $s = [
-            '@context'    => 'https://schema.org', '@type' => 'Product',
-            'name'        => html_entity_decode( get_the_title( $post->ID ) ),
-            'url'         => get_permalink( $post->ID ),
+            '@context' => 'https://schema.org', '@type' => 'Product',
+            'name'     => html_entity_decode( get_the_title( $post->ID ) ),
+            'url'      => get_permalink( $post->ID ),
             'description' => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
-            'brand'       => [ '@type' => 'Brand', 'name' => $g['org_name'] ],
+            'brand'    => [ '@type' => 'Brand', 'name' => $g['org_name'] ],
         ];
         $sku = get_post_meta( $post->ID, '_ras_sku', true );
         if ( $sku ) { $s['sku'] = $sku; }
         if ( $price ) {
             $avail = get_post_meta( $post->ID, '_ras_availability', true ) ?: 'InStock';
-            $valid  = get_post_meta( $post->ID, '_ras_price_until', true ) ?: gmdate( 'Y-m-d', strtotime( '+1 year' ) );
+            $valid = get_post_meta( $post->ID, '_ras_price_until', true ) ?: gmdate( 'Y-m-d', strtotime( '+1 year' ) );
             $s['offers'] = [
                 '@type' => 'Offer', 'price' => (string) $price,
                 'priceCurrency' => get_post_meta( $post->ID, '_ras_currency', true ) ?: 'USD',
@@ -286,7 +354,7 @@ class RAS_Frontend {
         return $s;
     }
 
-    /* ── Event ───────────────────────────────────── */
+    /* ── Event ────────────────────────────────────── */
     private static function event( $post, $g ) {
         $start = get_post_meta( $post->ID, '_ras_event_start', true );
         if ( ! $start ) { return null; }
@@ -302,86 +370,69 @@ class RAS_Frontend {
             'OnlineEventAttendanceMode'  => 'https://schema.org/OnlineEventAttendanceMode',
             'MixedEventAttendanceMode'   => 'https://schema.org/MixedEventAttendanceMode',
         ];
-        $raw_status = get_post_meta( $post->ID, '_ras_event_status', true ) ?: 'EventScheduled';
-        $raw_att    = get_post_meta( $post->ID, '_ras_event_attend', true ) ?: 'OfflineEventAttendanceMode';
-        $tz         = (float) get_option( 'gmt_offset', 0 );
-        $sign       = $tz >= 0 ? '+' : '-';
-        $tz_str     = $sign . sprintf( '%02d:00', abs( $tz ) );
-        $fmt_start  = date( 'Y-m-d\TH:i:s', strtotime( $start ) ) . $tz_str;
-
-        $s = [
+        $tz  = (float) get_option( 'gmt_offset', 0 );
+        $sgn = $tz >= 0 ? '+' : '-';
+        $tzs = $sgn . sprintf( '%02d:00', abs( $tz ) );
+        $s   = [
             '@context'            => 'https://schema.org', '@type' => 'Event',
             'name'                => html_entity_decode( get_the_title( $post->ID ) ),
-            'startDate'           => $fmt_start,
-            'eventStatus'         => $status_map[ $raw_status ] ?? 'https://schema.org/EventScheduled',
-            'eventAttendanceMode' => $att_map[ $raw_att ] ?? 'https://schema.org/OfflineEventAttendanceMode',
+            'startDate'           => date( 'Y-m-d\TH:i:s', strtotime( $start ) ) . $tzs,
+            'eventStatus'         => $status_map[ get_post_meta( $post->ID, '_ras_event_status', true ) ?? '' ] ?? 'https://schema.org/EventScheduled',
+            'eventAttendanceMode' => $att_map[ get_post_meta( $post->ID, '_ras_event_attend', true ) ?? '' ] ?? 'https://schema.org/OfflineEventAttendanceMode',
             'url'                 => get_permalink( $post->ID ),
             'description'         => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
             'organizer'           => [ '@type' => 'Organization', 'name' => $g['org_name'], 'url' => $g['org_url'] ],
         ];
-
         $end = get_post_meta( $post->ID, '_ras_event_end', true );
-        if ( $end ) { $s['endDate'] = date( 'Y-m-d\TH:i:s', strtotime( $end ) ) . $tz_str; }
-
+        if ( $end ) { $s['endDate'] = date( 'Y-m-d\TH:i:s', strtotime( $end ) ) . $tzs; }
         $venue = get_post_meta( $post->ID, '_ras_venue', true );
-        if ( 'OnlineEventAttendanceMode' === $raw_att ) {
-            $s['location'] = [ '@type' => 'VirtualLocation', 'url' => get_permalink( $post->ID ) ];
-        } elseif ( $venue ) {
-            $s['location'] = [ '@type' => 'Place', 'name' => $venue,
-                'address' => [ '@type' => 'PostalAddress',
-                    'streetAddress'   => get_post_meta( $post->ID, '_ras_venue_address', true ),
-                    'addressLocality' => get_post_meta( $post->ID, '_ras_venue_city', true ),
-                    'addressCountry'  => get_post_meta( $post->ID, '_ras_venue_country', true ) ] ];
+        if ( $venue ) {
+            $s['location'] = [ '@type' => 'Place', 'name' => $venue, 'address' => [
+                '@type' => 'PostalAddress',
+                'streetAddress'   => get_post_meta( $post->ID, '_ras_venue_address', true ),
+                'addressLocality' => get_post_meta( $post->ID, '_ras_venue_city', true ),
+                'addressCountry'  => get_post_meta( $post->ID, '_ras_venue_country', true ),
+            ] ];
         }
-
         $img = self::post_image( $post->ID );
         if ( $img ) { $s['image'] = $img; }
         return $s;
     }
 
-    /* ── Recipe ──────────────────────────────────── */
+    /* ── Recipe ───────────────────────────────────── */
     private static function recipe( $post, $g ) {
         $imgs = self::post_images( $post->ID );
-        if ( ! $imgs ) { return null; } // image required by Google
-
+        if ( ! $imgs ) { return null; }
         $s = [
-            '@context'      => 'https://schema.org', '@type' => 'Recipe',
-            'name'          => html_entity_decode( get_the_title( $post->ID ) ),
-            'url'           => get_permalink( $post->ID ),
-            'description'   => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
-            'image'         => count( $imgs ) > 1 ? $imgs : $imgs[0],
-            'author'        => [ '@type' => 'Person', 'name' => get_the_author_meta( 'display_name', $post->post_author ) ],
+            '@context' => 'https://schema.org', '@type' => 'Recipe',
+            'name'     => html_entity_decode( get_the_title( $post->ID ) ),
+            'url'      => get_permalink( $post->ID ),
+            'description' => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'image'    => count( $imgs ) > 1 ? $imgs : $imgs[0],
+            'author'   => [ '@type' => 'Person', 'name' => get_the_author_meta( 'display_name', $post->post_author ) ],
             'datePublished' => get_the_date( 'c', $post->ID ),
         ];
-
-        $times = [ 'prepTime' => '_ras_prep_time', 'cookTime' => '_ras_cook_time', 'totalTime' => '_ras_total_time' ];
-        foreach ( $times as $prop => $key ) {
+        foreach ( [ 'prepTime' => '_ras_prep_time', 'cookTime' => '_ras_cook_time', 'totalTime' => '_ras_total_time' ] as $prop => $key ) {
             $v = get_post_meta( $post->ID, $key, true );
             if ( $v ) { $s[ $prop ] = $v; }
         }
         $yield = get_post_meta( $post->ID, '_ras_recipe_yield', true );
         if ( $yield ) { $s['recipeYield'] = $yield; }
-
         $raw_ing = get_post_meta( $post->ID, '_ras_ingredients', true );
-        if ( $raw_ing ) {
-            $s['recipeIngredient'] = array_values( array_filter( array_map( 'trim', explode( "\n", $raw_ing ) ) ) );
-        }
-
+        if ( $raw_ing ) { $s['recipeIngredient'] = array_values( array_filter( array_map( 'trim', explode( "\n", $raw_ing ) ) ) ); }
         $raw_steps = get_post_meta( $post->ID, '_ras_steps', true );
         $steps = json_decode( stripslashes( (string) $raw_steps ), true ) ?: [];
         if ( $steps ) {
             $inst = [];
             foreach ( $steps as $i => $step ) {
                 if ( empty( $step['name'] ) ) { continue; }
-                $inst[] = [ '@type' => 'HowToStep', 'name' => $step['name'],
-                            'text' => $step['text'], 'url' => get_permalink( $post->ID ) . '#step-' . ( $i + 1 ) ];
+                $inst[] = [ '@type' => 'HowToStep', 'name' => $step['name'], 'text' => $step['text'],
+                             'url' => get_permalink( $post->ID ) . '#step-' . ( $i + 1 ) ];
             }
             if ( $inst ) { $s['recipeInstructions'] = $inst; }
         }
-
         $cal = get_post_meta( $post->ID, '_ras_calories', true );
         if ( $cal ) { $s['nutrition'] = [ '@type' => 'NutritionInformation', 'calories' => $cal . ' calories' ]; }
-
         $rating = get_post_meta( $post->ID, '_ras_rating', true );
         $rcount = get_post_meta( $post->ID, '_ras_rating_count', true );
         if ( $rating && $rcount ) {
@@ -392,21 +443,81 @@ class RAS_Frontend {
         return $s;
     }
 
-    /* ── LocalBusiness ───────────────────────────── */
+    /* ── LocalBusiness ────────────────────────────── */
     private static function local_business( $post, $g ) {
         $url = trailingslashit( $g['org_url'] );
-        $s = [
-            '@context' => 'https://schema.org', '@type' => 'LocalBusiness',
-            '@id'  => $url . '#localbusiness',
-            'name' => $g['org_name'], 'url' => $g['org_url'],
-        ];
+        $s   = [ '@context' => 'https://schema.org', '@type' => 'LocalBusiness',
+                 '@id' => $url . '#localbusiness', 'name' => $g['org_name'], 'url' => $g['org_url'] ];
         if ( $g['org_email'] ) { $s['email'] = $g['org_email']; }
         $img = self::post_image( $post->ID );
         if ( $img ) { $s['image'] = $img; }
         return $s;
     }
 
-    /* ── WebPage fallback ────────────────────────── */
+    /* ── JobPosting ───────────────────────────────── */
+    private static function job_posting( $post, $g ) {
+        return [
+            '@context'          => 'https://schema.org', '@type' => 'JobPosting',
+            'title'             => html_entity_decode( get_the_title( $post->ID ) ),
+            'description'       => wp_kses_post( $post->post_content ),
+            'datePosted'        => get_the_date( 'Y-m-d', $post->ID ),
+            'hiringOrganization'=> [ '@type' => 'Organization', 'name' => $g['org_name'], 'sameAs' => $g['org_url'] ],
+            'jobLocation'       => [ '@type' => 'Place', 'address' => [ '@type' => 'PostalAddress', 'addressCountry' => get_post_meta( $post->ID, '_ras_venue_country', true ) ?: '' ] ],
+        ];
+    }
+
+    /* ── Course ───────────────────────────────────── */
+    private static function course( $post, $g ) {
+        return [
+            '@context'    => 'https://schema.org', '@type' => 'Course',
+            'name'        => html_entity_decode( get_the_title( $post->ID ) ),
+            'description' => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'provider'    => [ '@type' => 'Organization', 'name' => $g['org_name'], 'sameAs' => $g['org_url'] ],
+            'url'         => get_permalink( $post->ID ),
+        ];
+    }
+
+    /* ── SoftwareApplication ──────────────────────── */
+    private static function software_app( $post, $g ) {
+        $s = [
+            '@context'        => 'https://schema.org', '@type' => 'SoftwareApplication',
+            'name'            => html_entity_decode( get_the_title( $post->ID ) ),
+            'url'             => get_permalink( $post->ID ),
+            'applicationCategory' => 'WebApplication',
+            'operatingSystem' => 'Web',
+            'description'     => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+        ];
+        $price = get_post_meta( $post->ID, '_ras_price', true );
+        $s['offers'] = [ '@type' => 'Offer',
+            'price' => $price ?: '0',
+            'priceCurrency' => get_post_meta( $post->ID, '_ras_currency', true ) ?: 'USD',
+        ];
+        $rating = get_post_meta( $post->ID, '_ras_rating', true );
+        $rcount = get_post_meta( $post->ID, '_ras_rating_count', true );
+        if ( $rating && $rcount ) {
+            $s['aggregateRating'] = [ '@type' => 'AggregateRating',
+                'ratingValue' => number_format( (float) $rating, 1 ), 'ratingCount' => (int) $rcount,
+                'bestRating' => '5', 'worstRating' => '1' ];
+        }
+        return $s;
+    }
+
+    /* ── VideoObject ──────────────────────────────── */
+    private static function video_object( $post, $g ) {
+        $img = self::post_image( $post->ID );
+        $s = [
+            '@context'     => 'https://schema.org', '@type' => 'VideoObject',
+            'name'         => html_entity_decode( get_the_title( $post->ID ) ),
+            'description'  => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'uploadDate'   => get_the_date( 'c', $post->ID ),
+            'url'          => get_permalink( $post->ID ),
+            'publisher'    => [ '@type' => 'Organization', 'name' => $g['org_name'] ],
+        ];
+        if ( $img ) { $s['thumbnailUrl'] = $img['url']; }
+        return $s;
+    }
+
+    /* ── WebPage fallback ─────────────────────────── */
     private static function webpage( $post, $g ) {
         $url = trailingslashit( $g['org_url'] );
         return [
@@ -416,39 +527,34 @@ class RAS_Frontend {
             'url'           => get_permalink( $post->ID ),
             'datePublished' => get_the_date( 'c', $post->ID ),
             'dateModified'  => get_the_modified_date( 'c', $post->ID ),
+            'description'   => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
             'isPartOf'      => [ '@type' => 'WebSite', '@id' => $url . '#website' ],
             'publisher'     => [ '@type' => 'Organization', '@id' => $url . '#organization' ],
         ];
     }
 
-    /* ── Image helpers ───────────────────────────── */
+    /* ── Image helpers ────────────────────────────── */
     private static function post_image( $post_id ) {
         if ( ! has_post_thumbnail( $post_id ) ) { return null; }
         $tid = get_post_thumbnail_id( $post_id );
         $src = wp_get_attachment_image_src( $tid, 'large' );
-        if ( ! $src ) { return null; }
-        return [ '@type' => 'ImageObject', 'url' => $src[0], 'width' => $src[1], 'height' => $src[2] ];
+        return $src ? [ '@type' => 'ImageObject', 'url' => $src[0], 'width' => $src[1], 'height' => $src[2] ] : null;
     }
-
     private static function post_images( $post_id ) {
         if ( ! has_post_thumbnail( $post_id ) ) { return []; }
         $tid  = get_post_thumbnail_id( $post_id );
         $imgs = [];
         foreach ( [ 'full', 'medium_large', 'thumbnail' ] as $size ) {
             $src = wp_get_attachment_image_src( $tid, $size );
-            if ( $src ) {
-                $imgs[] = [ '@type' => 'ImageObject', 'url' => $src[0], 'width' => $src[1], 'height' => $src[2] ];
-            }
+            if ( $src ) { $imgs[] = [ '@type' => 'ImageObject', 'url' => $src[0], 'width' => $src[1], 'height' => $src[2] ]; }
         }
         return array_unique( $imgs, SORT_REGULAR );
     }
-
     private static function image_dims( $url ) {
         $id = attachment_url_to_postid( $url );
         if ( ! $id ) { return null; }
-        $m = wp_get_attachment_metadata( $id );
+        $m  = wp_get_attachment_metadata( $id );
         return ( $m && isset( $m['width'] ) ) ? [ $m['width'], $m['height'] ] : null;
     }
 }
-
 RAS_Frontend::init();

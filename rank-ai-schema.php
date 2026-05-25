@@ -15,20 +15,8 @@
  * Update URI:   https://github.com/webkeith/Rank-AI-Schema
  *
  * @package RankAISchema
- *
- * ──────────────────────────────────────────────────────────────────────────
- *  GITHUB UPDATE CHECKER SETUP
- * ──────────────────────────────────────────────────────────────────────────
- *  1. Replace YOUR_GITHUB_USERNAME with your real GitHub username above and
- *     in the RAS_GITHUB_REPO constant below.
- *  2. Push releases to GitHub using a tag that matches the Version header
- *     (e.g. tag "v2.0.1" → WordPress sees version "2.0.1").
- *  3. For PRIVATE repos: set RAS_GITHUB_TOKEN to a Personal Access Token
- *     with "repo" scope. For PUBLIC repos leave it empty — no token needed.
- *  4. The plugin-update-checker library lives in lib/plugin-update-checker/
- *     and is bundled with the plugin (no Composer required on the site).
- * ──────────────────────────────────────────────────────────────────────────
  */
+
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
@@ -95,6 +83,7 @@ final class Rank_AI_Schema {
         require_once RAS_DIR . 'includes/class-ras-dashboard.php';
         require_once RAS_DIR . 'includes/class-ras-seo-analyzer.php';
         require_once RAS_DIR . 'includes/class-ras-seo-page.php';
+        require_once RAS_DIR . 'includes/class-ras-woo-bridge.php';
     }
 
     /* ── Admin menus ──────────────────────────────────── */
