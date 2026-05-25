@@ -30,11 +30,8 @@ define( 'RAS_BASE',        plugin_basename( __FILE__ ) );
 define( 'RAS_FILE',        __FILE__ );
 
 /* ── GitHub update settings — EDIT THESE ─────────────── */
-define( 'RAS_GITHUB_REPO',  'https://github.com/YOUR_GITHUB_USERNAME/rank-ai-schema' );
-define( 'RAS_GITHUB_TOKEN', '' ); // Leave empty for public repos.
-                                  // For private repos: paste a Personal Access Token here,
-                                  // or better — store it via wp-config.php:
-                                  //   define('RAS_GITHUB_TOKEN', 'ghp_xxxxxxxxxxxxxxxxxxxx');
+define( 'RAS_GITHUB_REPO',  'https://github.com/webkeith/Rank-AI-Schema' );
+define( 'RAS_GITHUB_TOKEN', '' );
 
 /* ── Bootstrap Plugin Update Checker ─────────────────── */
 require_once RAS_DIR . 'lib/plugin-update-checker/plugin-update-checker.php';
@@ -42,15 +39,15 @@ require_once RAS_DIR . 'lib/plugin-update-checker/plugin-update-checker.php';
 use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
 
 $ras_updater = PucFactory::buildUpdateChecker(
-    RAS_GITHUB_REPO,   // Your GitHub repo URL
-    RAS_FILE,          // Full path to the main plugin file
-    'rank-ai-schema'   // Plugin slug (must match the folder name exactly)
+    RAS_GITHUB_REPO,   
+    RAS_FILE,
+    'rank-ai-schema'
 );
 
 // Tell PUC to use GitHub Releases as the update source.
 // Create a GitHub Release tagged "v2.0.1" → WordPress will see version 2.0.1.
-$ras_updater->setBranch( 'main' );             // or 'master' — branch to track
-$ras_updater->getVcsApi()->enableReleaseAssets(); // use Release assets (the ZIP) if present
+$ras_updater->setBranch( 'main' );
+$ras_updater->getVcsApi()->enableReleaseAssets(); 
 
 // Private repo: attach a Personal Access Token.
 if ( defined( 'RAS_GITHUB_TOKEN' ) && RAS_GITHUB_TOKEN ) {
