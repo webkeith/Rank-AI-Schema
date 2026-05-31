@@ -173,7 +173,7 @@ class RAS_Version_Page {
                     </div>
                     <div class="ras-vb-meta">
                         <span class="ras-tag ras-tag-blue">v<?php echo esc_html( $current ); ?></span>
-                        <a href="https://github.com/YOUR_GITHUB_USERNAME/rank-ai-schema/releases" target="_blank" rel="noopener noreferrer" class="ras-btn ras-btn-ghost ras-btn-xs">GitHub Releases ↗</a>
+                        <a href="https://github.com/webkeith/Rank-AI-Schema/releases" target="_blank" rel="noopener noreferrer" class="ras-btn ras-btn-ghost ras-btn-xs">GitHub Releases ↗</a>
                     </div>
                 </div>
             </div>

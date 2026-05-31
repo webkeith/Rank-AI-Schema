@@ -1,25 +1,25 @@
 <?php
 /**
  * Plugin Name:  Rank AI Schema
- * Plugin URI:   https://github.com/YOUR_GITHUB_USERNAME/rank-ai-schema
+ * Plugin URI:   https://github.com/webkeith/Rank-AI-Schema
  * Description:  JSON-LD Schema markup + full SEO analysis engine with per-page scoring, site-wide reports, and rich results compliance.
  * Version:      2.0.0
- * Author:       Your Name
- * Author URI:   https://yourwebsite.com
+ * Author:       Keith Quinones
+ * Author URI:   https://github.com/webkeith
  * License:      GPL v2 or later
  * License URI:  https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:  rank-ai-schema
  * Domain Path:  /languages
  * Requires at least: 5.8
  * Requires PHP: 7.4
- * Update URI:   https://github.com/YOUR_GITHUB_USERNAME/rank-ai-schema
+ * Update URI:   https://github.com/webkeith/Rank-AI-Schema
  *
  * @package RankAISchema
  *
  * ──────────────────────────────────────────────────────────────────────────
  *  GITHUB UPDATE CHECKER SETUP
  * ──────────────────────────────────────────────────────────────────────────
- *  1. Replace YOUR_GITHUB_USERNAME with your real GitHub username above and
+ *  1. Replace webkeith with your real GitHub username above and
  *     in the RAS_GITHUB_REPO constant below.
  *  2. Push releases to GitHub using a tag that matches the Version header
  *     (e.g. tag "v2.0.1" → WordPress sees version "2.0.1").
@@ -42,7 +42,7 @@ define( 'RAS_BASE',        plugin_basename( __FILE__ ) );
 define( 'RAS_FILE',        __FILE__ );
 
 /* ── GitHub update settings — EDIT THESE ─────────────── */
-define( 'RAS_GITHUB_REPO',  'https://github.com/YOUR_GITHUB_USERNAME/rank-ai-schema' );
+define( 'RAS_GITHUB_REPO',  'https://github.com/webkeith/Rank-AI-Schema' );
 define( 'RAS_GITHUB_TOKEN', '' ); // Leave empty for public repos.
                                   // For private repos: paste a Personal Access Token here,
                                   // or better — store it via wp-config.php:

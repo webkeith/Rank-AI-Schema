@@ -19,7 +19,7 @@ cd /path/to/rank-ai-schema
 git init
 git add .
 git commit -m "Initial release v2.0.0"
-git remote add origin https://github.com/YOUR_USERNAME/rank-ai-schema.git
+git remote add origin https://github.com/webkeith/Rank-AI-Schema.git
 git push -u origin main
 ```
 
@@ -30,7 +30,7 @@ git push -u origin main
 Open `rank-ai-schema.php` and replace:
 
 ```php
-define( 'RAS_GITHUB_REPO',  'https://github.com/YOUR_GITHUB_USERNAME/rank-ai-schema' );
+define( 'RAS_GITHUB_REPO',  'https://github.com/webkeith/Rank-AI-Schema' );
 define( 'RAS_GITHUB_TOKEN', '' );
 ```
 
