@@ -1,0 +1,896 @@
+<?php
+/**
+ * Frontend — JSON-LD schema output & meta tags.
+ * Fully Google Rich Results compliant.
+ * Supports all public post types, custom post types, and WooCommerce products.
+ *
+ * @package GrapevineSEO
+ */
+if ( ! defined( 'ABSPATH' ) ) { exit; }
+
+class GVSEO_Frontend {
+
+    public static function init() {
+        add_action( 'wp_head', [ __CLASS__, 'output' ], 2 );
+    }
+
+    public static function output() {
+        $g       = GVSEO_Settings::get();
+        $schemas = [];
+
+        // 1. Organization (all pages).
+        if ( '1' === $g['organization'] ) {
+            $schemas[] = self::organization( $g );
+        }
+
+        // 2. LocalBusiness — one schema per location/branch (all pages).
+        $lb_locations = $g['lb_locations'] ?? [];
+        foreach ( $lb_locations as $li => $loc ) {
+            if ( ( $loc['enabled'] ?? '1' ) !== '1' ) { continue; }
+            $lb = self::output_local_business( $loc, $li, $g );
+            if ( $lb ) { $schemas[] = $lb; }
+        }
+
+        // 3. WebSite + Sitelinks Searchbox (homepage only).
+        if ( is_front_page() && '1' === $g['sitelinks'] ) {
+            $schemas[] = self::website( $g );
+        }
+
+        // 4. BreadcrumbList (non-home).
+        if ( ! is_front_page() && '1' === $g['breadcrumbs'] ) {
+            $bc = self::breadcrumbs();
+            if ( $bc ) { $schemas[] = $bc; }
+        }
+
+        // 5. Per-page schema (any singular post type, including CPTs and WC products).
+        if ( is_singular() ) {
+            $post_id   = get_the_ID();
+            $post_type = get_post_type( $post_id );
+            $excluded  = GVSEO_Settings::get_excluded_types();
+            // Skip schema entirely for excluded post types or manually excluded post IDs.
+            if ( ! in_array( $post_type, $excluded, true ) && ! GVSEO_Settings::is_post_excluded( $post_id ) ) {
+                $ps = self::page_schema( $post_id );
+                if ( $ps ) { $schemas[] = $ps; }
+            }
+        }
+
+        // 6. Meta/OG tags — skippable when another SEO plugin (Yoast/Rank Math) already outputs these.
+        if ( '1' === ( $g['meta_tags_enabled'] ?? '1' ) ) {
+            self::meta_tags();
+        }
+
+        foreach ( $schemas as $s ) {
+            if ( ! $s ) { continue; }
+            echo "\n<script type=\"application/ld+json\">\n";
+            echo wp_json_encode( $s, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ); // phpcs:ignore
+            echo "\n</script>\n";
+        }
+    }
+
+    /* ── Meta / OG tags ───────────────────────────── */
+    private static function meta_tags() {
+        if ( ! is_singular() ) { return; }
+        $id   = get_the_ID();
+        $desc = get_post_meta( $id, '_gvseo_meta_desc', true );
+        $og_t = get_post_meta( $id, '_gvseo_og_title', true );
+        $og_d = get_post_meta( $id, '_gvseo_og_desc', true );
+        $og_i = get_post_meta( $id, '_gvseo_og_image', true );
+        $noix = get_post_meta( $id, '_gvseo_noindex', true );
+
+        // WooCommerce short description as fallback description.
+        if ( ! $desc && GVSEO_Woo_Bridge::is_active() ) {
+            $product = wc_get_product( $id );
+            if ( $product ) {
+                $desc = wp_strip_all_tags( $product->get_short_description() );
+            }
+        }
+
+        if ( $desc )  { printf( '<meta name="description" content="%s">' . "\n", esc_attr( $desc ) ); }
+        if ( $noix )  { echo '<meta name="robots" content="noindex,nofollow">' . "\n"; }
+
+        $og_title = $og_t ?: get_the_title( $id );
+        $og_desc  = $og_d ?: $desc ?: wp_trim_words( get_the_excerpt( $id ), 30 );
+        $og_img   = $og_i ?: ( has_post_thumbnail( $id ) ? wp_get_attachment_url( get_post_thumbnail_id( $id ) ) : '' );
+
+        // WooCommerce product image fallback for OG.
+        if ( ! $og_img && GVSEO_Woo_Bridge::is_active() ) {
+            $product = wc_get_product( $id );
+            if ( $product ) {
+                $src = wp_get_attachment_image_src( $product->get_image_id(), 'full' );
+                if ( $src ) { $og_img = $src[0]; }
+            }
+        }
+
+        echo '<meta property="og:type" content="' . ( get_post_type( $id ) === 'product' ? 'product' : 'article' ) . '">' . "\n";
+        printf( '<meta property="og:title" content="%s">' . "\n", esc_attr( $og_title ) );
+        printf( '<meta property="og:url" content="%s">' . "\n", esc_url( get_permalink( $id ) ) );
+        if ( $og_desc ) { printf( '<meta property="og:description" content="%s">' . "\n", esc_attr( $og_desc ) ); }
+        if ( $og_img )  { printf( '<meta property="og:image" content="%s">' . "\n", esc_url( $og_img ) ); }
+
+        // WooCommerce OG product meta.
+        if ( get_post_type( $id ) === 'product' && GVSEO_Woo_Bridge::is_active() ) {
+            $product = wc_get_product( $id );
+            if ( $product && $product->get_price() ) {
+                printf( '<meta property="product:price:amount" content="%s">' . "\n", esc_attr( wc_format_decimal( $product->get_price(), 2 ) ) );
+                printf( '<meta property="product:price:currency" content="%s">' . "\n", esc_attr( get_woocommerce_currency() ) );
+            }
+        }
+    }
+
+    /* ── Per-page schema dispatcher ───────────────── */
+    public static function page_schema( $post_id ) {
+        $post      = get_post( $post_id );
+        $g         = GVSEO_Settings::get();
+        $mode      = get_post_meta( $post_id, '_gvseo_schema_mode', true ) ?: 'global';
+        $post_type = $post ? $post->post_type : 'post';
+
+        if ( 'disabled' === $mode ) { return null; }
+
+        // Schema type: override → per-page meta; global → CPT default from settings.
+        if ( 'override' === $mode ) {
+            $type = get_post_meta( $post_id, '_gvseo_schema_type', true ) ?: GVSEO_Settings::schema_type_for_post_type( $post_type );
+        } else {
+            $type = GVSEO_Settings::schema_type_for_post_type( $post_type );
+        }
+
+        switch ( $type ) {
+            case 'Article':
+            case 'BlogPosting':
+            case 'NewsArticle':
+                return self::article( $type, $post, $g );
+
+            case 'FAQPage':
+                return self::faq( $post );
+
+            case 'HowTo':
+                return self::howto( $post );
+
+            case 'Product':
+                // WooCommerce bridge takes priority when active and bridge is enabled.
+                if ( '1' === $g['woo_bridge'] && GVSEO_Woo_Bridge::is_active() && $post_type === 'product' ) {
+                    return GVSEO_Woo_Bridge::product_schema( $post_id, $g );
+                }
+                return self::product( $post, $g );
+
+            case 'Event':
+                return self::event( $post, $g );
+
+            case 'Recipe':
+                return self::recipe( $post, $g );
+
+            case 'Person':
+                return self::person( $post, $g );
+
+            case 'LocalBusiness':
+                return self::local_business( $post, $g );
+
+            case 'JobPosting':
+                return self::job_posting( $post, $g );
+
+            case 'Course':
+                return self::course( $post, $g );
+
+            case 'SoftwareApplication':
+                return self::software_app( $post, $g );
+
+            case 'VideoObject':
+                return self::video_object( $post, $g );
+
+            case 'Custom':
+                $raw = get_post_meta( $post_id, '_gvseo_custom_json', true );
+                $dec = json_decode( stripslashes( (string) $raw ), true );
+                return is_array( $dec ) ? $dec : null;
+
+            case 'WebPage':
+            default:
+                return self::webpage( $post, $g );
+        }
+    }
+
+    /* ── Organization ─────────────────────────────── */
+    private static function organization( $g ) {
+        $url = trailingslashit( $g['org_url'] );
+        $s = [
+            '@context' => 'https://schema.org',
+            '@type'    => 'Organization',
+            '@id'      => $url . '#organization',
+            'name'     => $g['org_name'],
+            'url'      => $g['org_url'],
+        ];
+
+        /* ── Logo ─────────────────────────────────── */
+        if ( $g['org_logo'] ) {
+            $dim  = self::image_dims( $g['org_logo'] );
+            $logo = [ '@type' => 'ImageObject', 'url' => $g['org_logo'] ];
+            if ( $dim ) { $logo['width'] = $dim[0]; $logo['height'] = $dim[1]; }
+            $s['logo'] = $logo;
+        }
+
+        /* ── Contact ──────────────────────────────── */
+        if ( ! empty( $g['org_email'] ) ) {
+            $s['email'] = $g['org_email'];
+        }
+        if ( ! empty( $g['org_phone'] ) ) {
+            $s['telephone'] = $g['org_phone'];
+        }
+        if ( ! empty( $g['org_email'] ) || ! empty( $g['org_phone'] ) ) {
+            $cp = [ '@type' => 'ContactPoint', 'contactType' => 'customer service' ];
+            if ( ! empty( $g['org_email'] ) ) { $cp['email']     = $g['org_email']; }
+            if ( ! empty( $g['org_phone'] ) ) { $cp['telephone'] = $g['org_phone']; }
+            $s['contactPoint'] = $cp;
+        }
+
+        /* ── Address (primary) ────────────────────── */
+        if ( ! empty( $g['org_street'] ) || ! empty( $g['org_city'] ) ) {
+            $addr = [ '@type' => 'PostalAddress' ];
+            if ( ! empty( $g['org_street'] ) )   { $addr['streetAddress']   = $g['org_street']; }
+            if ( ! empty( $g['org_city'] ) )      { $addr['addressLocality']  = $g['org_city']; }
+            if ( ! empty( $g['org_state'] ) )     { $addr['addressRegion']    = $g['org_state']; }
+            if ( ! empty( $g['org_postcode'] ) )  { $addr['postalCode']       = $g['org_postcode']; }
+            if ( ! empty( $g['org_country'] ) )   { $addr['addressCountry']   = strtoupper( $g['org_country'] ); }
+            $s['address'] = $addr;
+        }
+
+        /* ── Founder ──────────────────────────────── */
+        if ( ! empty( $g['org_founder'] ) ) {
+            $s['founder'] = [
+                '@type' => 'Person',
+                'name'  => $g['org_founder'],
+            ];
+        }
+
+        /* ── Department — lightweight @id references only ─────────
+         *
+         * Full LocalBusiness details live in the standalone JSON-LD blocks
+         * output separately. Here we use @id references so Google merges
+         * the department relationship with the full entity data via JSON-LD
+         * entity linking. This avoids duplication and is schema.org-compliant.
+         *
+         * @id values come from local_business_id() — slug-based and stable
+         * across reordering/removal of other locations, NOT array-index-based.
+         *
+         * Produces:
+         *   "department": [
+         *     { "@type": "LocalBusiness", "@id": "https://site.com/melbourne/#business" },
+         *     { "@type": "LocalBusiness", "@id": "https://site.com/sydney/#business" }
+         *   ]
+         * ─────────────────────────────────────────────────────────── */
+        $lb_locations = $g['lb_locations'] ?? [];
+        $departments  = [];
+        foreach ( $lb_locations as $li => $loc ) {
+            if ( ( $loc['enabled'] ?? '1' ) !== '1' ) { continue; }
+            $departments[] = [
+                '@type' => ! empty( $loc['type'] ) ? $loc['type'] : 'LocalBusiness',
+                '@id'   => self::local_business_id( $loc, $li, $g ),
+            ];
+        }
+
+        if ( ! empty( $departments ) ) {
+            $s['department'] = count( $departments ) === 1 ? $departments[0] : $departments;
+        }
+
+        /* ── sameAs social profiles ───────────────── */
+        $same = array_filter( [
+            $g['social_fb'] ?? '', $g['social_tw'] ?? '',
+            $g['social_ig'] ?? '', $g['social_li'] ?? '',
+            $g['social_yt'] ?? '', $g['social_tt'] ?? '',
+        ] );
+        if ( $same ) { $s['sameAs'] = array_values( $same ); }
+
+        return $s;
+    }
+
+    /* ── WebSite + Sitelinks ──────────────────────── */
+    private static function website( $g ) {
+        $url = trailingslashit( $g['org_url'] );
+        return [
+            '@context' => 'https://schema.org', '@type' => 'WebSite',
+            '@id' => $url . '#website', 'name' => $g['org_name'], 'url' => $g['org_url'],
+            'potentialAction' => [
+                '@type' => 'SearchAction',
+                'target' => [ '@type' => 'EntryPoint', 'urlTemplate' => $url . '?s={search_term_string}' ],
+                'query-input' => 'required name=search_term_string',
+            ],
+        ];
+    }
+
+    /* ── BreadcrumbList ───────────────────────────── */
+    private static function breadcrumbs() {
+        $items = [ [ '@type' => 'ListItem', 'position' => 1, 'name' => 'Home', 'item' => home_url('/') ] ];
+        $pos   = 2;
+        if ( is_singular() ) {
+            $post = get_post();
+            // WooCommerce: add product category.
+            if ( $post->post_type === 'product' ) {
+                $terms = get_the_terms( $post->ID, 'product_cat' );
+                if ( $terms && ! is_wp_error( $terms ) ) {
+                    $term    = array_shift( $terms );
+                    $items[] = [ '@type' => 'ListItem', 'position' => $pos++, 'name' => $term->name, 'item' => get_term_link( $term ) ];
+                }
+            } elseif ( 'post' === $post->post_type ) {
+                $cats = get_the_category( $post->ID );
+                if ( $cats ) {
+                    $items[] = [ '@type' => 'ListItem', 'position' => $pos++, 'name' => $cats[0]->name, 'item' => get_category_link( $cats[0]->term_id ) ];
+                }
+            } elseif ( is_post_type_hierarchical( $post->post_type ) ) {
+                // Hierarchical post types (pages, and hierarchical CPTs):
+                // walk the post_parent chain so nested pages get one
+                // crumb per ancestor, matching the actual URL structure.
+                $ancestors = array_reverse( get_post_ancestors( $post->ID ) ); // root → immediate parent
+                foreach ( $ancestors as $ancestor_id ) {
+                    $items[] = [
+                        '@type'    => 'ListItem',
+                        'position' => $pos++,
+                        'name'     => html_entity_decode( get_the_title( $ancestor_id ) ),
+                        'item'     => get_permalink( $ancestor_id ),
+                    ];
+                }
+            } else {
+                // Generic non-hierarchical CPT: add the post type archive link.
+                $pt_obj = get_post_type_object( $post->post_type );
+                if ( $pt_obj && $pt_obj->has_archive ) {
+                    $archive_url = get_post_type_archive_link( $post->post_type );
+                    if ( $archive_url ) {
+                        $items[] = [ '@type' => 'ListItem', 'position' => $pos++, 'name' => $pt_obj->label, 'item' => $archive_url ];
+                    }
+                }
+            }
+            $items[] = [ '@type' => 'ListItem', 'position' => $pos, 'name' => html_entity_decode( get_the_title( $post->ID ) ), 'item' => get_permalink( $post->ID ) ];
+        } elseif ( is_category() || is_tag() || is_tax() ) {
+            $t = get_queried_object();
+            $items[] = [ '@type' => 'ListItem', 'position' => $pos, 'name' => $t->name, 'item' => get_term_link( $t ) ];
+        } elseif ( is_post_type_archive() ) {
+            $pt = get_queried_object();
+            $items[] = [ '@type' => 'ListItem', 'position' => $pos, 'name' => $pt->label, 'item' => get_post_type_archive_link( $pt->name ) ];
+        }
+        if ( count( $items ) < 2 ) { return null; }
+        return [ '@context' => 'https://schema.org', '@type' => 'BreadcrumbList', 'itemListElement' => $items ];
+    }
+
+    /* ── Article / BlogPosting / NewsArticle ──────── */
+    private static function article( $type, $post, $g ) {
+        $url     = get_permalink( $post->ID );
+        $g_url   = trailingslashit( $g['org_url'] );
+        $title   = html_entity_decode( get_the_title( $post->ID ) );
+
+        $pub  = [ '@type' => 'Organization', '@id' => $g_url . '#organization', 'name' => $g['org_name'] ];
+        if ( $g['org_logo'] ) {
+            $dim  = self::image_dims( $g['org_logo'] );
+            $logo = [ '@type' => 'ImageObject', 'url' => $g['org_logo'] ];
+            if ( $dim ) { $logo['width'] = $dim[0]; $logo['height'] = $dim[1]; }
+            $pub['logo'] = $logo;
+        }
+
+        $author_name = get_post_meta( $post->ID, '_gvseo_author_name', true ) ?: get_the_author_meta( 'display_name', $post->post_author );
+        $author_url  = get_post_meta( $post->ID, '_gvseo_author_url', true ) ?: get_author_posts_url( $post->post_author );
+
+        $s = [
+            '@context' => 'https://schema.org', '@type' => $type,
+            '@id'      => $url . '#article',
+            'headline' => mb_substr( $title, 0, 110 ),
+            'url'      => $url,
+            'mainEntityOfPage' => [ '@type' => 'WebPage', '@id' => $url ],
+            'datePublished'    => get_the_date( 'c', $post->ID ),
+            'dateModified'     => get_the_modified_date( 'c', $post->ID ),
+            'author'           => [ '@type' => 'Person', 'name' => $author_name, 'url' => $author_url ],
+            'publisher'        => $pub,
+            'description'      => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'inLanguage'       => get_bloginfo( 'language' ),
+        ];
+        $imgs = self::post_images( $post->ID );
+        if ( $imgs ) { $s['image'] = count( $imgs ) > 1 ? $imgs : $imgs[0]; }
+        return $s;
+    }
+
+    /* ── FAQPage ──────────────────────────────────── */
+    private static function faq( $post ) {
+        $raw   = get_post_meta( $post->ID, '_gvseo_faq_items', true );
+        $items = json_decode( stripslashes( (string) $raw ), true ) ?: [];
+        $main  = [];
+        foreach ( $items as $item ) {
+            if ( empty( $item['q'] ) ) { continue; }
+            $main[] = [ '@type' => 'Question', 'name' => sanitize_text_field( $item['q'] ),
+                        'acceptedAnswer' => [ '@type' => 'Answer', 'text' => wp_kses_post( $item['a'] ) ] ];
+        }
+        if ( ! $main ) { return null; }
+        return [ '@context' => 'https://schema.org', '@type' => 'FAQPage',
+                 'name' => html_entity_decode( get_the_title( $post->ID ) ),
+                 'url'  => get_permalink( $post->ID ), 'mainEntity' => $main ];
+    }
+
+    /* ── HowTo ────────────────────────────────────── */
+    private static function howto( $post ) {
+        $raw   = get_post_meta( $post->ID, '_gvseo_steps', true );
+        $steps = json_decode( stripslashes( (string) $raw ), true ) ?: [];
+        $built = [];
+        foreach ( $steps as $i => $step ) {
+            if ( empty( $step['name'] ) ) { continue; }
+            $built[] = [ '@type' => 'HowToStep', 'position' => $i + 1,
+                         'name' => sanitize_text_field( $step['name'] ),
+                         'text' => sanitize_textarea_field( $step['text'] ),
+                         'url'  => get_permalink( $post->ID ) . '#step-' . ( $i + 1 ) ];
+        }
+        if ( ! $built ) { return null; }
+        $s = [ '@context' => 'https://schema.org', '@type' => 'HowTo',
+               'name' => html_entity_decode( get_the_title( $post->ID ) ),
+               'url'  => get_permalink( $post->ID ), 'step' => $built ];
+        $tt = get_post_meta( $post->ID, '_gvseo_total_time', true );
+        if ( $tt ) { $s['totalTime'] = $tt; }
+        $img = self::post_image( $post->ID );
+        if ( $img ) { $s['image'] = $img; }
+        return $s;
+    }
+
+    /* ── Product (manual fields — non-WooCommerce) ── */
+    private static function product( $post, $g ) {
+        $price = get_post_meta( $post->ID, '_gvseo_price', true );
+        $s = [
+            '@context' => 'https://schema.org', '@type' => 'Product',
+            'name'     => html_entity_decode( get_the_title( $post->ID ) ),
+            'url'      => get_permalink( $post->ID ),
+            'description' => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'brand'    => [ '@type' => 'Brand', 'name' => $g['org_name'] ],
+        ];
+        $sku = get_post_meta( $post->ID, '_gvseo_sku', true );
+        if ( $sku ) { $s['sku'] = $sku; }
+        if ( $price ) {
+            $avail = get_post_meta( $post->ID, '_gvseo_availability', true ) ?: 'InStock';
+            $valid = get_post_meta( $post->ID, '_gvseo_price_until', true ) ?: gmdate( 'Y-m-d', strtotime( '+1 year' ) );
+            $s['offers'] = [
+                '@type' => 'Offer', 'price' => (string) $price,
+                'priceCurrency' => get_post_meta( $post->ID, '_gvseo_currency', true ) ?: 'USD',
+                'availability' => 'https://schema.org/' . $avail,
+                'priceValidUntil' => $valid,
+                'url' => get_permalink( $post->ID ),
+                'seller' => [ '@type' => 'Organization', 'name' => $g['org_name'] ],
+            ];
+        }
+        $rating = get_post_meta( $post->ID, '_gvseo_rating', true );
+        $rcount = get_post_meta( $post->ID, '_gvseo_rating_count', true );
+        if ( $rating && $rcount ) {
+            $s['aggregateRating'] = [ '@type' => 'AggregateRating',
+                'ratingValue' => number_format( (float) $rating, 1 ),
+                'ratingCount' => (int) $rcount, 'bestRating' => '5', 'worstRating' => '1' ];
+        }
+        $imgs = self::post_images( $post->ID );
+        if ( $imgs ) { $s['image'] = count( $imgs ) > 1 ? $imgs : $imgs[0]; }
+        return $s;
+    }
+
+    /* ── Event ────────────────────────────────────── */
+    private static function event( $post, $g ) {
+        $start = get_post_meta( $post->ID, '_gvseo_event_start', true );
+        if ( ! $start ) { return null; }
+        $status_map = [
+            'EventScheduled'   => 'https://schema.org/EventScheduled',
+            'EventCancelled'   => 'https://schema.org/EventCancelled',
+            'EventPostponed'   => 'https://schema.org/EventPostponed',
+            'EventRescheduled' => 'https://schema.org/EventRescheduled',
+            'EventMovedOnline' => 'https://schema.org/EventMovedOnline',
+        ];
+        $att_map = [
+            'OfflineEventAttendanceMode' => 'https://schema.org/OfflineEventAttendanceMode',
+            'OnlineEventAttendanceMode'  => 'https://schema.org/OnlineEventAttendanceMode',
+            'MixedEventAttendanceMode'   => 'https://schema.org/MixedEventAttendanceMode',
+        ];
+        $tz  = (float) get_option( 'gmt_offset', 0 );
+        $sgn = $tz >= 0 ? '+' : '-';
+        $tzs = $sgn . sprintf( '%02d:00', abs( $tz ) );
+        $s   = [
+            '@context'            => 'https://schema.org', '@type' => 'Event',
+            'name'                => html_entity_decode( get_the_title( $post->ID ) ),
+            'startDate'           => gmdate( 'Y-m-d\TH:i:s', strtotime( $start ) ) . $tzs,
+            'eventStatus'         => $status_map[ get_post_meta( $post->ID, '_gvseo_event_status', true ) ?? '' ] ?? 'https://schema.org/EventScheduled',
+            'eventAttendanceMode' => $att_map[ get_post_meta( $post->ID, '_gvseo_event_attend', true ) ?? '' ] ?? 'https://schema.org/OfflineEventAttendanceMode',
+            'url'                 => get_permalink( $post->ID ),
+            'description'         => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'organizer'           => [ '@type' => 'Organization', 'name' => $g['org_name'], 'url' => $g['org_url'] ],
+        ];
+        $end = get_post_meta( $post->ID, '_gvseo_event_end', true );
+        if ( $end ) { $s['endDate'] = gmdate( 'Y-m-d\\TH:i:s', strtotime( $end ) ) . $tzs; }
+        $venue = get_post_meta( $post->ID, '_gvseo_venue', true );
+        if ( $venue ) {
+            $s['location'] = [ '@type' => 'Place', 'name' => $venue, 'address' => [
+                '@type' => 'PostalAddress',
+                'streetAddress'   => get_post_meta( $post->ID, '_gvseo_venue_address', true ),
+                'addressLocality' => get_post_meta( $post->ID, '_gvseo_venue_city', true ),
+                'addressCountry'  => get_post_meta( $post->ID, '_gvseo_venue_country', true ),
+            ] ];
+        }
+        $img = self::post_image( $post->ID );
+        if ( $img ) { $s['image'] = $img; }
+        return $s;
+    }
+
+    /* ── Recipe ───────────────────────────────────── */
+    private static function recipe( $post, $g ) {
+        $imgs = self::post_images( $post->ID );
+        if ( ! $imgs ) { return null; }
+        $s = [
+            '@context' => 'https://schema.org', '@type' => 'Recipe',
+            'name'     => html_entity_decode( get_the_title( $post->ID ) ),
+            'url'      => get_permalink( $post->ID ),
+            'description' => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'image'    => count( $imgs ) > 1 ? $imgs : $imgs[0],
+            'author'   => [ '@type' => 'Person', 'name' => get_the_author_meta( 'display_name', $post->post_author ) ],
+            'datePublished' => get_the_date( 'c', $post->ID ),
+        ];
+        foreach ( [ 'prepTime' => '_gvseo_prep_time', 'cookTime' => '_gvseo_cook_time', 'totalTime' => '_gvseo_total_time' ] as $prop => $key ) {
+            $v = get_post_meta( $post->ID, $key, true );
+            if ( $v ) { $s[ $prop ] = $v; }
+        }
+        $yield = get_post_meta( $post->ID, '_gvseo_recipe_yield', true );
+        if ( $yield ) { $s['recipeYield'] = $yield; }
+        $raw_ing = get_post_meta( $post->ID, '_gvseo_ingredients', true );
+        if ( $raw_ing ) { $s['recipeIngredient'] = array_values( array_filter( array_map( 'trim', explode( "\n", $raw_ing ) ) ) ); }
+        $raw_steps = get_post_meta( $post->ID, '_gvseo_steps', true );
+        $steps = json_decode( stripslashes( (string) $raw_steps ), true ) ?: [];
+        if ( $steps ) {
+            $inst = [];
+            foreach ( $steps as $i => $step ) {
+                if ( empty( $step['name'] ) ) { continue; }
+                $inst[] = [ '@type' => 'HowToStep', 'name' => $step['name'], 'text' => $step['text'],
+                             'url' => get_permalink( $post->ID ) . '#step-' . ( $i + 1 ) ];
+            }
+            if ( $inst ) { $s['recipeInstructions'] = $inst; }
+        }
+        $cal = get_post_meta( $post->ID, '_gvseo_calories', true );
+        if ( $cal ) { $s['nutrition'] = [ '@type' => 'NutritionInformation', 'calories' => $cal . ' calories' ]; }
+        $rating = get_post_meta( $post->ID, '_gvseo_rating', true );
+        $rcount = get_post_meta( $post->ID, '_gvseo_rating_count', true );
+        if ( $rating && $rcount ) {
+            $s['aggregateRating'] = [ '@type' => 'AggregateRating',
+                'ratingValue' => number_format( (float) $rating, 1 ),
+                'ratingCount' => (int) $rcount, 'bestRating' => '5', 'worstRating' => '1' ];
+        }
+        return $s;
+    }
+
+    /* ── LocalBusiness — Global Schema (all pages) ──── */
+
+    /**
+     * Builds a fully schema.org-validator-compliant LocalBusiness schema.
+     * Outputs as a global entity on every page (not per-page).
+     * Validated against https://validator.schema.org/
+     *
+     * @param  array $g Global settings.
+     * @return array|null
+     */
+    /**
+     * Stable, slug-scoped @id for a LocalBusiness location.
+     *
+     * IMPORTANT: this must NOT derive from array index ($li) — array
+     * indices shift whenever a location is reordered or an earlier one
+     * is removed (see admin.js reindexLocations()), which would silently
+     * change a location's @id and make it look like a new/different
+     * entity to Google and any other schema consumer that cached the
+     * old @id. The slug is a persisted, admin-set field that stays with
+     * its location regardless of array position.
+     *
+     * Format: https://[domain]/[location-slug]/#business
+     */
+    public static function local_business_id( $loc, $li, $g ) {
+        $site_url = trailingslashit( $g['org_url'] );
+        $slug     = ! empty( $loc['slug'] ) ? sanitize_title( $loc['slug'] ) : '';
+
+        if ( $slug ) {
+            return $site_url . $slug . '/#business';
+        }
+
+        // Legacy fallback only — should not occur once the 2.11.0 migration
+        // has backfilled slugs for all existing locations. Kept so a location
+        // added and rendered in the same request before its first save (slug
+        // not yet persisted) still gets a usable, if temporary, @id.
+        return $site_url . ( $li > 0 ? '#localbusiness-' . (int) $li : '#localbusiness' );
+    }
+
+    public static function output_local_business( $loc, $li, $g ) {
+        $site_url = trailingslashit( $g['org_url'] );
+        $lb_name  = ! empty( $loc['name'] ) ? $loc['name'] : $g['org_name'];
+        $lb_type  = ! empty( $loc['type'] ) ? $loc['type'] : 'LocalBusiness';
+        $lb_url   = $g['org_url'];
+
+        $s = [
+            '@context' => 'https://schema.org',
+            '@type'    => $lb_type,
+            '@id'      => self::local_business_id( $loc, $li, $g ),
+            'name'     => $lb_name,
+            'url'      => $lb_url,
+        ];
+
+        // Description
+        if ( ! empty( $loc['description'] ) ) {
+            $s['description'] = $loc['description'];
+        }
+
+        // Telephone
+        $phone = ! empty( $loc['phone'] ) ? $loc['phone'] : ( $g['org_phone'] ?? '' );
+        if ( $phone ) { $s['telephone'] = $phone; }
+
+        // Email
+        $email = ! empty( $loc['email'] ) ? $loc['email'] : ( $g['org_email'] ?? '' );
+        if ( $email ) { $s['email'] = $email; }
+
+        // Image + Logo from org
+        if ( ! empty( $g['org_logo'] ) ) {
+            $dim  = self::image_dims( $g['org_logo'] );
+            $logo = [ '@type' => 'ImageObject', 'url' => $g['org_logo'] ];
+            if ( $dim ) { $logo['width'] = $dim[0]; $logo['height'] = $dim[1]; }
+            $s['image'] = $logo;
+            $s['logo']  = $logo;
+        }
+
+        // Postal Address
+        $street   = ! empty( $loc['street'] )   ? $loc['street']   : ( $g['org_street'] ?? '' );
+        $city     = ! empty( $loc['city'] )     ? $loc['city']     : ( $g['org_city'] ?? '' );
+        $state    = ! empty( $loc['state'] )    ? $loc['state']    : ( $g['org_state'] ?? '' );
+        $postcode = ! empty( $loc['postcode'] ) ? $loc['postcode'] : ( $g['org_postcode'] ?? '' );
+        $country  = ! empty( $loc['country'] )  ? $loc['country']  : ( $g['org_country'] ?? '' );
+
+        if ( $street || $city ) {
+            $addr = [ '@type' => 'PostalAddress' ];
+            if ( $street )   { $addr['streetAddress']   = $street; }
+            if ( $city )     { $addr['addressLocality']  = $city; }
+            if ( $state )    { $addr['addressRegion']    = $state; }
+            if ( $postcode ) { $addr['postalCode']       = $postcode; }
+            if ( $country )  { $addr['addressCountry']   = strtoupper( $country ); }
+            $s['address'] = $addr;
+        }
+
+        // Geo coordinates
+        if ( ! empty( $loc['lat'] ) && ! empty( $loc['lng'] ) ) {
+            $s['geo'] = [
+                '@type'     => 'GeoCoordinates',
+                'latitude'  => (float) $loc['lat'],
+                'longitude' => (float) $loc['lng'],
+            ];
+        }
+
+        // Map URL
+        if ( ! empty( $loc['maps_url'] ) ) {
+            $s['hasMap'] = $loc['maps_url'];
+        }
+
+        // Business details
+        if ( ! empty( $loc['price_range'] ) )  { $s['priceRange']         = $loc['price_range']; }
+        if ( ! empty( $loc['payment'] ) )       { $s['paymentAccepted']    = $loc['payment']; }
+        if ( ! empty( $loc['currencies'] ) )    { $s['currenciesAccepted'] = $loc['currencies']; }
+        if ( ! empty( $loc['area_served'] ) )   { $s['areaServed']         = $loc['area_served']; }
+
+        // Opening hours — schema.org OpeningHoursSpecification
+        // DayOfWeek values must be full schema.org URIs per validator
+        $day_uri_map = [
+            'Monday'    => 'https://schema.org/Monday',
+            'Tuesday'   => 'https://schema.org/Tuesday',
+            'Wednesday' => 'https://schema.org/Wednesday',
+            'Thursday'  => 'https://schema.org/Thursday',
+            'Friday'    => 'https://schema.org/Friday',
+            'Saturday'  => 'https://schema.org/Saturday',
+            'Sunday'    => 'https://schema.org/Sunday',
+        ];
+        // Two-letter abbreviations for the simple openingHours string format,
+        // in weekday order so contiguous selections can be compressed to
+        // ranges (e.g. Mo-Fr) rather than listed day-by-day.
+        $day_abbr_order = [
+            'Monday' => 'Mo', 'Tuesday' => 'Tu', 'Wednesday' => 'We',
+            'Thursday' => 'Th', 'Friday' => 'Fr', 'Saturday' => 'Sa', 'Sunday' => 'Su',
+        ];
+        $week_order = array_keys( $day_abbr_order );
+
+        $hours_spec    = [];
+        $opening_hours = [];
+        foreach ( (array) ( $loc['hours'] ?? [] ) as $group ) {
+            if ( empty( $group['days'] ) || empty( $group['opens'] ) || empty( $group['closes'] ) ) {
+                continue;
+            }
+            $day_uris = [];
+            foreach ( (array) $group['days'] as $day ) {
+                if ( isset( $day_uri_map[ $day ] ) ) {
+                    $day_uris[] = $day_uri_map[ $day ];
+                }
+            }
+            if ( ! $day_uris ) { continue; }
+            $hours_spec[] = [
+                '@type'      => 'OpeningHoursSpecification',
+                'dayOfWeek'  => $day_uris,
+                'opens'      => $group['opens'],
+                'closes'     => $group['closes'],
+            ];
+
+            // Simple string format: "Mo-Fr 09:00-17:00" (contiguous days
+            // compressed to a range; non-contiguous groups fall back to a
+            // comma-separated list — both are valid schema.org syntax).
+            $selected = array_values( array_intersect( $week_order, (array) $group['days'] ) );
+            if ( ! $selected ) { continue; }
+            $ranges = [];
+            $start  = $selected[0];
+            $prev   = $selected[0];
+            foreach ( array_slice( $selected, 1 ) as $day ) {
+                $is_next = array_search( $day, $week_order, true ) === array_search( $prev, $week_order, true ) + 1;
+                if ( ! $is_next ) {
+                    $ranges[] = ( $start === $prev ) ? $day_abbr_order[ $start ] : $day_abbr_order[ $start ] . '-' . $day_abbr_order[ $prev ];
+                    $start = $day;
+                }
+                $prev = $day;
+            }
+            $ranges[] = ( $start === $prev ) ? $day_abbr_order[ $start ] : $day_abbr_order[ $start ] . '-' . $day_abbr_order[ $prev ];
+
+            $opening_hours[] = implode( ',', $ranges ) . ' ' . $group['opens'] . '-' . $group['closes'];
+        }
+        if ( $hours_spec ) {
+            $s['openingHoursSpecification'] = $hours_spec;
+        }
+        if ( $opening_hours ) {
+            $s['openingHours'] = $opening_hours;
+        }
+
+        // sameAs — inherit from org social profiles
+        if ( '1' === ( $loc['same_as_org'] ?? '1' ) ) {
+            $same = array_filter( [
+                $g['social_fb'] ?? '', $g['social_tw'] ?? '',
+                $g['social_ig'] ?? '', $g['social_li'] ?? '',
+                $g['social_yt'] ?? '', $g['social_tt'] ?? '',
+            ] );
+            if ( $same ) { $s['sameAs'] = array_values( $same ); }
+        }
+
+        // Link to the Organization entity (recommended by schema.org)
+        $s['parentOrganization'] = [
+            '@type' => 'Organization',
+            '@id'   => $site_url . '#organization',
+        ];
+
+        return $s;
+    }
+
+    /* ── LocalBusiness — Per-page schema type ────────── */
+    private static function local_business( $post, $g ) {
+        // If there are configured locations, use the first enabled one.
+        $locs = $g['lb_locations'] ?? [];
+        foreach ( $locs as $li => $loc ) {
+            if ( ( $loc['enabled'] ?? '1' ) !== '1' ) { continue; }
+            return self::output_local_business( $loc, $li, $g );
+        }
+        // Fallback: minimal LocalBusiness from org settings.
+        $url = trailingslashit( $g['org_url'] );
+        return [
+            '@context' => 'https://schema.org',
+            '@type'    => 'LocalBusiness',
+            '@id'      => $url . '#localbusiness',
+            'name'     => $g['org_name'],
+            'url'      => $g['org_url'],
+        ];
+    }
+
+    /* ── JobPosting ───────────────────────────────── */
+    private static function job_posting( $post, $g ) {
+        return [
+            '@context'          => 'https://schema.org', '@type' => 'JobPosting',
+            'title'             => html_entity_decode( get_the_title( $post->ID ) ),
+            'description'       => wp_kses_post( $post->post_content ),
+            'datePosted'        => get_the_date( 'Y-m-d', $post->ID ),
+            'hiringOrganization'=> [ '@type' => 'Organization', 'name' => $g['org_name'], 'sameAs' => $g['org_url'] ],
+            'jobLocation'       => [ '@type' => 'Place', 'address' => [ '@type' => 'PostalAddress', 'addressCountry' => get_post_meta( $post->ID, '_gvseo_venue_country', true ) ?: '' ] ],
+        ];
+    }
+
+    /* ── Course ───────────────────────────────────── */
+    private static function course( $post, $g ) {
+        return [
+            '@context'    => 'https://schema.org', '@type' => 'Course',
+            'name'        => html_entity_decode( get_the_title( $post->ID ) ),
+            'description' => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'provider'    => [ '@type' => 'Organization', 'name' => $g['org_name'], 'sameAs' => $g['org_url'] ],
+            'url'         => get_permalink( $post->ID ),
+        ];
+    }
+
+    /* ── Person ───────────────────────────────────── */
+    private static function person( $post, $g ) {
+        $job_title  = get_post_meta( $post->ID, '_gvseo_person_job_title', true );
+        $works_for  = get_post_meta( $post->ID, '_gvseo_person_works_for', true ) ?: $g['org_name'];
+        $email      = get_post_meta( $post->ID, '_gvseo_person_email', true );
+        $sameas_raw = get_post_meta( $post->ID, '_gvseo_person_sameas', true );
+        $sameas     = array_values( array_filter( array_map( 'trim', explode( "\n", (string) $sameas_raw ) ) ) );
+
+        $s = [
+            '@context'    => 'https://schema.org', '@type' => 'Person',
+            'name'        => html_entity_decode( get_the_title( $post->ID ) ),
+            'url'         => get_permalink( $post->ID ),
+            'description' => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+        ];
+
+        $img = self::post_image( $post->ID );
+        if ( $img ) { $s['image'] = $img['url']; }
+
+        if ( $job_title ) { $s['jobTitle'] = $job_title; }
+        if ( $works_for ) {
+            $s['worksFor'] = [ '@type' => 'Organization', 'name' => $works_for, 'sameAs' => $g['org_url'] ];
+        }
+        if ( $email ) { $s['email'] = 'mailto:' . sanitize_email( $email ); }
+        if ( $sameas ) { $s['sameAs'] = $sameas; }
+
+        return $s;
+    }
+
+    /* ── SoftwareApplication ──────────────────────── */
+    private static function software_app( $post, $g ) {
+        $s = [
+            '@context'        => 'https://schema.org', '@type' => 'SoftwareApplication',
+            'name'            => html_entity_decode( get_the_title( $post->ID ) ),
+            'url'             => get_permalink( $post->ID ),
+            'applicationCategory' => 'WebApplication',
+            'operatingSystem' => 'Web',
+            'description'     => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+        ];
+        $price = get_post_meta( $post->ID, '_gvseo_price', true );
+        $s['offers'] = [ '@type' => 'Offer',
+            'price' => $price ?: '0',
+            'priceCurrency' => get_post_meta( $post->ID, '_gvseo_currency', true ) ?: 'USD',
+        ];
+        $rating = get_post_meta( $post->ID, '_gvseo_rating', true );
+        $rcount = get_post_meta( $post->ID, '_gvseo_rating_count', true );
+        if ( $rating && $rcount ) {
+            $s['aggregateRating'] = [ '@type' => 'AggregateRating',
+                'ratingValue' => number_format( (float) $rating, 1 ), 'ratingCount' => (int) $rcount,
+                'bestRating' => '5', 'worstRating' => '1' ];
+        }
+        return $s;
+    }
+
+    /* ── VideoObject ──────────────────────────────── */
+    private static function video_object( $post, $g ) {
+        $img = self::post_image( $post->ID );
+        $s = [
+            '@context'     => 'https://schema.org', '@type' => 'VideoObject',
+            'name'         => html_entity_decode( get_the_title( $post->ID ) ),
+            'description'  => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'uploadDate'   => get_the_date( 'c', $post->ID ),
+            'url'          => get_permalink( $post->ID ),
+            'publisher'    => [ '@type' => 'Organization', 'name' => $g['org_name'] ],
+        ];
+        if ( $img ) { $s['thumbnailUrl'] = $img['url']; }
+        return $s;
+    }
+
+    /* ── WebPage fallback ─────────────────────────── */
+    private static function webpage( $post, $g ) {
+        $url = trailingslashit( $g['org_url'] );
+        return [
+            '@context'      => 'https://schema.org', '@type' => 'WebPage',
+            '@id'           => get_permalink( $post->ID ) . '#webpage',
+            'name'          => html_entity_decode( get_the_title( $post->ID ) ),
+            'url'           => get_permalink( $post->ID ),
+            'datePublished' => get_the_date( 'c', $post->ID ),
+            'dateModified'  => get_the_modified_date( 'c', $post->ID ),
+            'description'   => wp_strip_all_tags( get_the_excerpt( $post->ID ) ),
+            'isPartOf'      => [ '@type' => 'WebSite', '@id' => $url . '#website' ],
+            'publisher'     => [ '@type' => 'Organization', '@id' => $url . '#organization' ],
+        ];
+    }
+
+    /* ── Image helpers ────────────────────────────── */
+    private static function post_image( $post_id ) {
+        if ( ! has_post_thumbnail( $post_id ) ) { return null; }
+        $tid = get_post_thumbnail_id( $post_id );
+        $src = wp_get_attachment_image_src( $tid, 'large' );
+        return $src ? [ '@type' => 'ImageObject', 'url' => $src[0], 'width' => $src[1], 'height' => $src[2] ] : null;
+    }
+    private static function post_images( $post_id ) {
+        if ( ! has_post_thumbnail( $post_id ) ) { return []; }
+        $tid  = get_post_thumbnail_id( $post_id );
+        $imgs = [];
+        foreach ( [ 'full', 'medium_large', 'thumbnail' ] as $size ) {
+            $src = wp_get_attachment_image_src( $tid, $size );
+            if ( $src ) { $imgs[] = [ '@type' => 'ImageObject', 'url' => $src[0], 'width' => $src[1], 'height' => $src[2] ]; }
+        }
+        return array_unique( $imgs, SORT_REGULAR );
+    }
+    private static function image_dims( $url ) {
+        $id = attachment_url_to_postid( $url );
+        if ( ! $id ) { return null; }
+        $m  = wp_get_attachment_metadata( $id );
+        return ( $m && isset( $m['width'] ) ) ? [ $m['width'], $m['height'] ] : null;
+    }
+}
+GVSEO_Frontend::init();
